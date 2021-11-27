@@ -1,28 +1,29 @@
 #include "pomodoro.h"
 #define WDTASKS_LIGHT_SLEEP
+#include "pt.h"
+
+static struct pt g_ptBlink, g_ptButton, g_ptPomodoro ;
 
 
-T_BUTTON readButton(void) {
-  T_BUTTON l_value ;
+uint8_t readButton(void) {
+  uint8_t l_value ;
 
-  if (g_var.flags & POMO_BUTTON_SHORT) l_value = BUTTON_SHORT ;
-    else if (g_var.flags & POMO_BUTTON_LONG) l_value = BUTTON_LONG ;
-      else l_value = BUTTON_NONE ;
-  g_var.flags &= ~(POMO_BUTTON_SHORT | POMO_BUTTON_LONG) ;
+  l_value = getFlag(BUTTON_MASK) ;
+  clearFlag(BUTTON_MASK) ;
   return l_value ;
 }
 
 
 void setLeds(uint8_t p_on) {
   if (p_on) {
-    switch(g_var.state & POMO_STEPS) {
-      case POMO_READY:
+    switch (g_flags & STEP_MASK) {
+      case STEP_READY:
         PORTB |= (_BV(PIN_GREEN) | _BV(PIN_RED)) ;
         break ;
-      case POMO_WORK:
+      case STEP_WORK:
         PORTB |= _BV(PIN_RED) ;
         break ;
-      case POMO_PAUSE:
+      case STEP_PAUSE:
         PORTB |= _BV(PIN_GREEN) ;
         break ;
     }
@@ -31,95 +32,117 @@ void setLeds(uint8_t p_on) {
 }
 
 
-void cbTkBlink(void) {
-  static uint8_t l_state = 0 ;
-  static uint8_t l_count = 0 ;
+uint8_t ptBlink(struct pt *p_pt) {
+  static uint8_t l_step ;
+  static uint8_t l_off ;
+  static uint8_t l_clock ;
 
-  if (g_var.state != l_state) {
+  PT_BEGIN(p_pt) ;
+
     setLeds(0) ;
-    l_count = 0 ;
-    l_state = g_var.state ;
-  }
+    l_step = getFlag(STEP_MASK) ;
+    if (l_step == STEP_READY)
+      l_off = OFF_READY ;
+    else if (l_step == STEP_ENDED)
+      l_off = OFF_ENDED ;
+    else
+      l_off = OFF_RUNNING ;
 
-  if (isReady()) {
-    uint8_t l_ticks = ((g_var.state & POMO_LEVELS) + 1) * 2 ;
-    if (l_count < l_ticks) setLeds((l_count & 1) == 0) ;
-      else if (l_count < READY_OFF) setLeds(0) ;
-        else { l_count = 0 ; return ; }
-  } else if (isEnded()) {
-    if (l_count < ENDED_ON) setLeds(1) ;
-      else if (l_count < ENDED_OFF) setLeds(0) ;
-        else { l_count = 0 ; return ; }
-  } else {
-    if (l_count < RUNNING_ON) setLeds(1) ;
-      else if (l_count < RUNNING_OFF) setLeds(0) ;
-        else { l_count = 0 ; return ; }
-  }
-  l_count++ ;
+    for(;;) {
+      setLeds(1) ;
+      l_clock = WdSched_Clock() ;
+      while (WdSched_Clock() - l_clock < ON_DELAY) {
+        if (getFlag(STEP_MASK) != l_step) PT_RESTART(p_pt) ;
+        PT_YIELD(p_pt) ;
+      }
+      setLeds(0) ;
+      l_clock = WdSched_Clock() ;
+      while (WdSched_Clock() - l_clock < l_off) {
+        if (getFlag(STEP_MASK) != l_step) PT_RESTART(p_pt) ;
+        PT_YIELD(p_pt) ;
+      }
+    }
+
+  PT_END(p_pt) ;
+}
+
+
+void cbTkBlink(void) {
+  ptBlink(&g_ptBlink) ;
+}
+
+
+uint8_t ptButton(struct pt *p_pt) {
+  static uint8_t l_count ;
+
+  PT_BEGIN(p_pt) ;
+
+    for(;;) {
+      l_count = 0 ;
+      while (PINB & _BV(PIN_BUTTON)) { // Wait until button pressed
+        PT_YIELD(p_pt) ;
+        if (l_count >= SECOND * 10) { // Forget previously pressed button after 10s
+          clearFlag(BUTTON_MASK) ;
+          l_count = 0 ;
+        } else
+          l_count++ ;
+      }
+      l_count = 0 ;
+      while (!(PINB & _BV(PIN_BUTTON))) { // Wait until button released
+        PT_YIELD(p_pt) ;
+        l_count++ ;
+      }
+      clearFlag(BUTTON_MASK) ;
+      if (l_count >= (SECOND * 2))
+        setFlag(BUTTON_LONG) ;
+      else if (l_count)
+        setFlag(BUTTON_SHORT) ;
+    }
+
+  PT_END(p_pt) ;
 }
 
 
 void cbTkButton(void) {
-  static uint8_t l_count = 0 ;
+  ptButton(&g_ptButton) ;
+}
 
-  if (PINB & _BV(PIN_BUTTON)) { // Button released
-    g_var.flags &= ~(POMO_BUTTON_SHORT | POMO_BUTTON_LONG) ;
-    if (l_count >= (SECOND * 2))
-      g_var.flags |= POMO_BUTTON_LONG ;
-    else if (l_count)
-      g_var.flags |= POMO_BUTTON_SHORT ;
-    l_count = 0 ;
-  } else
-    l_count++ ;
+
+uint8_t ptPomodoro(struct pt *p_pt) {
+  static uint8_t l_level ;
+  static uint8_t l_button ;
+  static uint8_t l_clock ;
+
+  PT_BEGIN(p_pt) ;
+    for(;;) {
+      l_button = readButton() ;
+      if (l_button == BUTTON_LONG) {} //  ETEINDRE
+      if (l_button == BUTTON_SHORT) break ;
+      PT_YIELD(p_pt) ;
+    }
+    for (l_level=0 ; l_level<4 ; l_level++) {
+      l_clock = WdSched_Clock() ;
+      while (WdSched_Clock()-l_clock < MN_WORK) {
+        l_button = readButton() ;
+        if (l_button == BUTTON_LONG) PT_RESTART(p_pt) ;
+        if (l_button == BUTTON_SHORT) break ;
+        PT_YIELD(p_pt) ;
+      }
+      l_clock = WdSched_Clock() ;
+      while (WdSched_Clock()-l_clock < (l_level == 3) ? MN_BREAK : MN_PAUSE) {
+        l_button = readButton() ;
+        if (l_button == BUTTON_LONG) PT_RESTART(p_pt) ;
+        if (l_button == BUTTON_SHORT) break ;
+        PT_YIELD(p_pt) ;
+      }
+    }
+
+  PT_END(p_pt) ;
 }
 
 
 void cbTkPomodoro(void) {
-  static uint8_t l_previous = 0 ;
-  static uint16_t l_elapsed = 0 ;
-
-  T_BUTTON l_button = readButton() ;
-
-  if (l_button == BUTTON_LONG) {
-    if (isReady()) {} // ETEINDRE
-      else g_var.state |= POMO_ENDED ;
-  }
-
-  uint16_t l_limit = 0 ;
-  switch(g_var.state & POMO_STEPS) {
-    case POMO_WORK :
-      l_limit = MN_WORK ;
-      break ;
-    case POMO_PAUSE :
-      if (g_var.state & POMO_PAUSE4) l_limit = MN_BREAK ;
-        else l_limit = MN_PAUSE ;
-      break ;
-  }
-  if (l_elapsed >= l_limit) g_var.state |= POMO_ENDED ;
-
-  if ((l_button == BUTTON_SHORT) && isEnded()) {
-    uint8_t l_level = (g_var.state & POMO_LEVELS) ;
-    switch (g_var.state & POMO_STEPS) {
-      case POMO_READY :
-        g_var.state = l_level | POMO_WORK ;
-        break ;
-      case POMO_WORK :
-        g_var.state = l_level | POMO_PAUSE ;
-        break ;
-      case POMO_PAUSE :
-        if (++l_level >= 4) l_level = 0 ;
-        g_var.state = POMO_READY | l_level ;
-        break ;
-      default :
-        g_var.state = POMO_READY ;
-    }
-  }
-
-  if (g_var.state != l_previous) {
-    l_elapsed = 0 ;
-    l_previous = g_var.state ;
-  } else
-    l_elapsed++ ;
+  ptPomodoro(&g_ptPomodoro) ;
 }
 
 
@@ -130,11 +153,11 @@ void Init_Pins(void) {
 
 
 void Init_Tasks(void) {
-  WdSched_Init(g_tasks,TASK_COUNT,TICK_UNIT) ;
-
-  WdTask_Init(TASK_BLINK,MS_250,&cbTkBlink) ;
-  WdTask_Init(TASK_BUTTON,MS_250,&cbTkButton) ;
-  WdTask_Init(TASK_POMODORO,SECOND,&cbTkPomodoro) ;
+  WdSched_Init(g_tasks,TICK_UNIT) ;
+  PT_INIT(&g_ptBlink) ;
+  WdTask_Enable(WdTask_Init(MS_250,0,&cbTkBlink)) ;
+  WdTask_Enable(WdTask_Init(MS_250,0,&cbTkButton)) ;
+  WdTask_Enable(WdTask_Init(SECOND,0,&cbTkPomodoro)) ;
 }
 
 
