@@ -1,5 +1,5 @@
 BASE=pomodoro
-MYLIBS=wdtasks.h wdtasks.c $(BASE).h
+MYLIBS=wdtasks.h wdtasks.c pt.h $(BASE).h
 
 CC=avr-gcc
 CC_MCU=attiny85
